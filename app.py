@@ -73,8 +73,7 @@ with c4:
     kv_off = st.number_input("Kv_off (Eoff电压指数)", value=1.2)
     kv_rec = st.number_input("Kv_rec (Erec电压指数)", value=0.6)
     mode = st.selectbox("调制模式", ["SVPWM", "SPWM/PWM"])
-
-# --- 4. 核心计算引擎 (多维插值 + 闭环迭代) ---
+    # --- 4. 核心计算引擎 (多维插值 + 闭环迭代) ---
 def advanced_interp(df, target_i, target_t, item_name):
     clean_df = df.dropna()
     temp_list, val_list = [], []
@@ -122,4 +121,18 @@ if st.button("🚀 执行全参数电热闭环仿真"):
         tj_new = t_case + p_total * rth_jc
         
         if abs(tj_new - tj_loop) < 0.05: break
-        tj_loop = tj_
+        tj_loop = tj_new
+            # --- 结果展示 ---
+    st.divider()
+    st.subheader("3. 仿真结果分析")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("稳定结温 Tj", f"{tj_loop:.2f} ℃")
+    r2.metric("导通损耗 P_cond", f"{p_cond:.2f} W")
+    r3.metric("开关损耗 P_sw", f"{p_on+p_off+p_rec:.2f} W")
+    r4.metric("总功耗 P_total", f"{p_total:.2f} W")
+
+    with st.expander("查看当前应用的物理模型与公式"):
+        st.latex(r"P_{on} = \frac{1}{\pi} f_{sw} \cdot E_{on}(I, T_j) \cdot (\frac{V_{dc}}{V_{ref}})^{Kv_{on}}")
+        if mode == "SVPWM":
+            st.write("当前 SVPWM 导通修正项 (马鞍波解析):")
+            st.latex(r"K_r = \frac{24\cos\phi - 2\sqrt{3}\cos(2\theta) - 3\sqrt{3}}{24}")
