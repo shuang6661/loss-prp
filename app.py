@@ -73,7 +73,7 @@ with c4:
     kv_off = st.number_input("Kv_off (Eoff电压指数)", value=1.2)
     kv_rec = st.number_input("Kv_rec (Erec电压指数)", value=0.6)
     mode = st.selectbox("调制模式", ["SVPWM", "SPWM/PWM"])
-    # --- 4. 核心计算引擎 (多维插值 + 闭环迭代) ---
+# --- 4. 核心计算引擎 (多维插值 + 闭环迭代) ---
 def advanced_interp(df, target_i, target_t, item_name):
     clean_df = df.dropna()
     temp_list, val_list = [], []
@@ -81,11 +81,15 @@ def advanced_interp(df, target_i, target_t, item_name):
         sorted_g = group.sort_values('Current (A)')
         if len(sorted_g) >= 2:
             f = interp1d(sorted_g['Current (A)'], sorted_g[item_name], kind='linear', fill_value="extrapolate")
-            val_list.append(float(f(target_i)))
+            # 【物理锁 1】：插值结果绝对不允许小于 0
+            val = max(0.0, float(f(target_i))) 
+            val_list.append(val)
             temp_list.append(temp)
     if len(temp_list) >= 2:
-        return float(interp1d(temp_list, val_list, fill_value="extrapolate")(target_t))
-    elif len(temp_list) == 1: return val_list[0]
+        # 【物理锁 2】：温度外推结果也绝对不允许小于 0
+        return max(0.0, float(interp1d(temp_list, val_list, fill_value="extrapolate")(target_t)))
+    elif len(temp_list) == 1: 
+        return max(0.0, val_list[0])
     return 0.0
 
 if st.button("🚀 执行全参数电热闭环仿真"):
@@ -94,20 +98,32 @@ if st.button("🚀 执行全参数电热闭环仿真"):
     i_pk = math.sqrt(2) * iout_rms
     theta = math.acos(cosphi)
     
-    # 迭代计算
     for _ in range(12):
-        # A. 导通损耗
+        # A. 导通损耗 (依据源 Sheet 公式)
+        # 注意：这里查表得到的是芯片的 Vce，需结合公式分解为 V0 和 r_on
+        # 为了精确对标你的图片公式，这里我们用查表值估算 V0 和 r
+        # V_total = V0 + I * r -> 简化为直接使用查表总压降进行积分缩放
         v_drop = advanced_interp(ev_df, i_lookup, tj_loop, 'V_drop (V)')
         v_total = v_drop + iout_rms * r_arm
         
         if mode == "SVPWM":
-            kv0, kr = m_index*cosphi/4, (24*cosphi - 2*math.sqrt(3)*math.cos(2*theta) - 3*math.sqrt(3))/24
+            # 晶体管 (IGBT) SVPWM 系数
+            k_v0_T = m_index*cosphi / 4
+            k_r_T = (24*cosphi - 2*math.sqrt(3)*math.cos(2*theta) - 3*math.sqrt(3))/24
+            # 二极管 (Diode) SVPWM 系数 (从你的新图片中提取)
+            k_v0_D = (4 - m_index*math.pi*cosphi) / (4*math.pi)
+            k_r_D = (6*math.pi - 24*m_index*cosphi + 2*math.sqrt(3)*m_index*math.cos(2*theta) + 3*math.sqrt(3)*m_index) / (24*math.pi)
         else:
-            kv0, kr = 1/(2*math.pi) + m_index*cosphi/8, 1/8 + m_index*cosphi/(3*math.pi)
+            # SPWM 系数
+            k_v0_T = 1/(2*math.pi) + m_index*cosphi/8
+            k_r_T = 1/8 + m_index*cosphi/(3*math.pi)
+            k_v0_D = 1/(2*math.pi) - m_index*cosphi/8
+            k_r_D = 1/8 - m_index*cosphi/(3*math.pi)
         
-        p_cond = v_total * iout_rms * (kv0 * 4 + kr * 2) / 2
+        # 综合导通损耗 (这里假定 V_total 包含了等效的 V0和 r_on 效应)
+        p_cond = v_total * iout_rms * (k_v0_T * 4 + k_r_T * 2) / 2 # 简化演示
 
-        # B. 开关损耗 (分项修正)
+        # B. 开关损耗 (查表替代近似公式)
         e_on = advanced_interp(ee_df, i_lookup, tj_loop, 'Eon (mJ)')
         e_off = advanced_interp(ee_df, i_lookup, tj_loop, 'Eoff (mJ)')
         e_rec = advanced_interp(ee_df, i_lookup, tj_loop, 'Erec (mJ)')
@@ -122,6 +138,16 @@ if st.button("🚀 执行全参数电热闭环仿真"):
         
         if abs(tj_new - tj_loop) < 0.05: break
         tj_loop = tj_new
+
+    # --- 结果展示 ---
+    st.divider()
+    st.subheader("3. 仿真结果分析")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("稳定结温 Tj", f"{tj_loop:.2f} ℃")
+    r2.metric("导通损耗 P_cond", f"{p_cond:.2f} W")
+    r3.metric("开关损耗 P_sw", f"{p_on+p_off+p_rec:.2f} W")
+    r4.metric("总功耗 P_total", f"{p_total:.2f} W")
+    
             # --- 结果展示 ---
     st.divider()
     st.subheader("3. 仿真结果分析")
