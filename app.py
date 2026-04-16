@@ -4,8 +4,8 @@ import numpy as np
 import math
 from scipy.interpolate import interp1d
 
-st.set_page_config(page_title="BYD模块全维仿真-防忘备注版", layout="wide")
-st.title("🛡️ 功率模块多架构电热联合仿真平台 (带备注专家版)")
+st.set_page_config(page_title="BYD模块全维仿真-热源分离版", layout="wide")
+st.title("🛡️ 功率模块多架构电热联合仿真平台 (热源分离版)")
 
 # ==========================================
 # 侧边栏: 全局架构与目标定义
@@ -33,6 +33,7 @@ with st.sidebar:
     st.header("🎯 仿真目标重构")
     n_sim = st.number_input("目标仿真芯片数 (N_sim)", value=6, min_value=1, 
                             help="【扩容/减容核心】你想评估多少并联芯片的模块？填入此数，损耗会自动按此规模折算")
+
     st.divider()
     st.header("🔄 热学计算工作流")
     sim_mode = st.radio("模式选择", ["A. 开环盲算 (已知结温)", "B. 闭环迭代 (已知热阻)"])
@@ -158,12 +159,13 @@ def calc_sw_power_analytical(df, i_pk_lookup, tj, item_name, fsw, vdc_act, v_ref
     t_corr = 1.0 + active_t_coeff * (tj - t_ref_dp)
     return (1.0 / math.pi) * fsw * (e_base_pk * r_corr * t_corr / 1000.0) * ((vdc_act / v_ref) ** kv)
 
-if st.button("🚀 执 行 全 参 数 仿 真 计 算 (一镜到底)", use_container_width=True):
+if st.button("🚀 执 行 全 参 数 仿 真 计 算 (导出热源数据)", use_container_width=True):
     # 底层归一化
     norm_ev_main = normalize_vi_df(ev_main, n_src_cond)
     norm_ev_diode = normalize_vi_df(ev_diode, n_src_cond)
     norm_ee_main = normalize_ei_df(ee_main, n_src_sw, ['Eon (mJ)', 'Eoff (mJ)'])
     norm_ee_diode = normalize_ei_df(ee_diode, n_src_sw, ['Erec (mJ)'])
+
     # 目标层级重构
     i_pk_chip = math.sqrt(2) * (iout_rms / n_sim)
     theta = math.acos(cosphi)
@@ -185,8 +187,7 @@ if st.button("🚀 执 行 全 参 数 仿 真 计 算 (一镜到底)", use_cont
         r_d_chip = (v_pk_d - v_hf_d) / (i_pk_chip / 2) if i_pk_chip > 0 else 0
         v0_d = max(0.0, v_pk_d - r_d_chip * i_pk_chip)
         r_d_total = r_d_chip + r_arm_chip_equiv
-
-        # 2. 解析公式积分 (单芯级)
+                # 2. 解析公式积分 (单芯级)
         if mode == "SVPWM":
             p_cond_v0_m = (m_index * i_pk_chip * v0_m * cosphi) / 4.0
             coeff_r_m = (24*cosphi - 2*math.sqrt(3)*math.cos(2*theta) - 3*math.sqrt(3)) / 24.0
@@ -204,22 +205,56 @@ if st.button("🚀 执 行 全 参 数 仿 真 计 算 (一镜到底)", use_cont
         
         i_corr_factor = (iout_rms / ( (i_pk_chip*n_sim) / math.sqrt(2))) ** ki_frd if ki_frd > 0 else 1.0
         p_sw_diode_chip = calc_sw_power_analytical(norm_ee_diode, i_pk_chip, tj_current, 'Erec (mJ)', fsw, vdc_act, v_ref, kv_frd, 1.0, 1.0, 0.0, t_coeff_frd, t_ref_dp) * i_corr_factor
-                # 3. 结果放大至目标级
-        p_total = (p_cond_main_chip + p_on_chip + p_off_chip + p_cond_diode_chip + p_sw_diode_chip) * n_sim
+
+        # 3. 按照芯片进行热源聚合
+        p_total_main_chip = p_cond_main_chip + p_on_chip + p_off_chip
+        p_total_diode_chip = p_cond_diode_chip + p_sw_diode_chip
+        
+        # 4. 模块整臂发热放大
+        p_total_main = p_total_main_chip * n_sim
+        p_total_diode = p_total_diode_chip * n_sim
+        p_total = p_total_main + p_total_diode
         
         if "闭环" in sim_mode:
             tj_new = t_case + p_total * rth_jc
             if abs(tj_new - tj_current) < 0.05: break
             tj_current = tj_new
 
-    # --- 最终面板 ---
-    st.success(f"✅ 计算完成！已基于归一化单芯模型重构为 **{n_sim}芯** 模块损耗数据。")
+    # ==========================================
+        # 结果展示面板 (重构为热仿真导向)
+    # ==========================================
+    st.success(f"✅ 计算完成！已分离主开关与二极管的发热热源数据。")
+    
+    # 顶层汇总
     r1, r2, r3, r4 = st.columns(4)
     r1.metric("仿真收敛结温 Tj", f"{tj_current:.1f} ℃")
-    r2.metric("主开关导通总损耗", f"{p_cond_main_chip*n_sim:.1f} W")
-    r3.metric("主开关动态总损耗", f"{(p_on_chip+p_off_chip)*n_sim:.1f} W")
-    r4.metric("模块桥臂总功耗", f"{p_total:.1f} W")
+    r2.metric("模块整臂发热总功率", f"{p_total:.1f} W")
+    r3.metric("🔴 主开关 (IGBT/SiC) 总损耗", f"{p_total_main:.1f} W")
+    r4.metric("🔵 续流二极管 (FRD) 总损耗", f"{p_total_diode:.1f} W")
 
+    st.divider()
+    
+    # CAE 热源明细拆解
+    st.markdown("#### 📉 热仿真 (CAE) 发热源明细拆解")
+    col_m, col_d = st.columns(2)
+    
+    with col_m:
+        st.info(f"**🔴 主开关管 (IGBT/SiC) 发热数据 (占比 {p_total_main/p_total*100:.1f}%)**" if p_total > 0 else "**🔴 主开关管明细**")
+        st.write(f"- 模块级主开关总损耗: **{p_total_main:.1f} W**")
+        st.write(f"- (其中) 导通损耗: {p_cond_main_chip*n_sim:.1f} W")
+        st.write(f"- (其中) 开关损耗: {(p_on_chip+p_off_chip)*n_sim:.1f} W")
+        st.markdown(f"> 📌 **输入 Icepak/Flotherm 用的单颗芯片发热率:** \n> ### **{p_total_main_chip:.2f} W / 颗**")
+
+    with col_d:
+        st.info(f"**🔵 续流二极管 (FRD) 发热数据 (占比 {p_total_diode/p_total*100:.1f}%)**" if p_total > 0 else "**🔵 二极管明细**")
+        st.write(f"- 模块级二极管总损耗: **{p_total_diode:.1f} W**")
+        st.write(f"- (其中) 导通损耗: {p_cond_diode_chip*n_sim:.1f} W")
+        st.write(f"- (其中) 恢复损耗: {p_sw_diode_chip*n_sim:.1f} W")
+        st.markdown(f"> 📌 **输入 Icepak/Flotherm 用的单颗芯片发热率:** \n> ### **{p_total_diode_chip:.2f} W / 颗**")
+
+    # ==========================================
+    # 底层逻辑与数学公式透传
+    # ==========================================
     st.divider()
     with st.expander("🔬 查看底层计算逻辑与应用的数学公式 (永久对标手册)"):
         st.markdown("#### 1. 导通损耗 (Conduction Loss)")
@@ -229,7 +264,8 @@ if st.button("🚀 执 行 全 参 数 仿 真 计 算 (一镜到底)", use_cont
         else:
             st.write("已启用 **SPWM** 正弦波调制解析积分：")
             st.latex(r"K_{v0} = \frac{1}{2\pi} + \frac{M\cos\phi}{8}, \quad K_r = \frac{1}{8} + \frac{M\cos\phi}{3\pi}")
-        st.write(f"注：当前仿真内阻 $R_{{arm}} = {r_arm_mohm} \text{{ m}}\Omega$ 已叠加至单芯电阻项进行综合积分。")
+        if r_arm_mohm > 0:
+            st.write(f"已叠加外部封装寄生内阻 $R_{{arm}} = {r_arm_mohm} \text{{ m}}\Omega$ 参与导通积分。")
             
         st.markdown("#### 2. 开关损耗 (Switching Loss)")
         st.write("解析积分公式（1/π 线性近似推导）：")
