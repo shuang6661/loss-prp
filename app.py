@@ -250,6 +250,38 @@ if st.button("🚀 执 行 全 工 况 仿 真 计 算", use_container_width=Tru
     with col_d:
         st.info(f"🔵 二极管单颗发热率: **{p_cond_d_chip + p_sw_d_chip:.2f} W**")
 
-    with st.expander("🔬 查看底层应用的物理公式 (知识对标)"):
-        st.latex(r"P_{cond} = K_{v0}V_0I_{pk} + K_r R I_{pk}^2")
-        st.latex(r"P_{sw} = \frac{1}{\pi} f_{sw} E(I_{pk}) \cdot (\frac{R_{act}}{R_{ref}})^{K_r} \cdot [1 + T_c(T_j-T_{ref})] \cdot (\frac{V_{dc}}{V_{ref}})^{K_v}")
+    # ==========================================
+    # 底部：底层物理公式全量展开展示 (知识传承基石)
+    # ==========================================
+    with st.expander("🔬 查看底层应用的完整物理公式 (与手稿笔记 100% 对标)", expanded=False):
+        st.markdown("### 📘 导通损耗 (Conduction Loss)")
+        st.write("程序已基于多维插值动态提取 $V_{CE0}/V_{f0}$ 及等效内阻 $R_{CE}/R_F$。其中 $I_{pk} = \sqrt{2}I_{out}$。")
+        
+        st.markdown("#### 1. SPWM 调制模型 (正弦波平均解析)")
+        st.latex(r"P_{cond\_IGBT} = \left(\frac{1}{2\pi} + \frac{M\cos\phi}{8}\right) \cdot V_{CE0} \cdot I_{pk} + \left(\frac{1}{8} + \frac{M\cos\phi}{3\pi}\right) \cdot R_{CE} \cdot I_{pk}^2")
+        st.latex(r"P_{cond\_D} = \left(\frac{1}{2\pi} - \frac{M\cos\phi}{8}\right) \cdot V_{F0} \cdot I_{pk} + \left(\frac{1}{8} - \frac{M\cos\phi}{3\pi}\right) \cdot R_{F} \cdot I_{pk}^2")
+
+        st.markdown("#### 2. SVPWM 调制模型 (空间矢量马鞍波解析)")
+        st.latex(r"P_{cond\_IGBT} \approx \frac{1}{4} M I_{pk} V_{CE0} \cos\phi + \left( \frac{24\cos\phi - 2\sqrt{3}\cos(2\varphi) - 3\sqrt{3}}{24\pi} \right) M R_{CE} I_{pk}^2")
+        st.latex(r"P_{cond\_D} \approx \left(\frac{4 - M\pi\cos\phi}{4\pi}\right) V_{F0} I_{pk} + \left(\frac{6\pi - 24M\cos\phi + 2\sqrt{3}M\cos(2\varphi) + 3\sqrt{3}M}{24\pi}\right) R_F I_{pk}^2")
+        st.info("💡 补充：若选择 **SiC 模块** 且处于开通状态，程序底层将强制令 $V_{CE0} = 0$，仅保留纯电阻损耗项。")
+
+        st.markdown("---")
+        st.markdown("### 📕 开关损耗 (Switching Loss)")
+        st.write("程序已对基础查表能量进行 **驱动电阻补偿、电压拟合指数补偿、温漂漂移补偿** 的三维修正：")
+        
+        st.markdown("#### 1. 主开关管开通与关断损耗 ($P_{sw\_on}$ & $P_{sw\_off}$)")
+        st.latex(r"E_{on\_adj} = E_{on\_nom}(I_{pk}) \cdot \left(\frac{R_{on\_act}}{R_{g,on\_ref}}\right)^{K_{ron}} \cdot \left[1 + T_{c\_igbt}(T_j - T_{ref\_dp})\right]")
+        st.latex(r"P_{sw\_on} = \frac{1}{\pi} f_{sw} E_{on\_adj} \cdot \left(\frac{V_{dc}}{V_{nom}}\right)^{K_{v\_on}}")
+        st.write("*(关断损耗 $P_{sw\_off}$ 同理，分别代入 $E_{off\_nom}$、关断电阻及其特有系数 $K_{roff}, K_{v\_off}$)*")
+
+        st.markdown("#### 2. 续流二极管反向恢复损耗 ($P_{sw\_FRD}$)")
+        st.write("已集成用于修正不同工况电流偏差的基波放大指数 $K_{i\_frd}$：")
+        st.latex(r"E_{rec\_adj} = E_{rec\_nom}(I_{pk}) \cdot \left[1 + T_{cerr}(T_j - T_{ref\_dp})\right]")
+        st.latex(r"P_{sw\_FRD} = \frac{1}{\pi} f_{sw} E_{rec\_adj} \cdot \left(\frac{I_{out}}{I_{pk}/\sqrt{2}}\right)^{K_{i\_frd}} \cdot \left(\frac{V_{dc}}{V_{nom}}\right)^{K_{v\_frd}}")
+        
+        st.markdown("---")
+        st.markdown("### 🛑 极限堵转工况 (Stall Mode)")
+        st.write("当选择最恶劣堵转时，程序将舍弃 $1/\pi$ 正弦平滑均值，按照最大占空比进行直流连续轰炸发热计算：")
+        st.latex(r"P_{cond\_stall} = D_{max} \cdot (V_0 I_{pk} + R I_{pk}^2) \quad \text{其中 } D_{max} = \frac{1+M}{2}")
+        st.latex(r"P_{sw\_stall} = f_{sw} \cdot E_{adj\_total}(I_{pk})")
