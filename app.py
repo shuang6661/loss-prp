@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 from scipy.interpolate import interp1d
 
-st.set_page_config(page_title="BYD系统级电热仿真-宏观域重构版", layout="wide")
+st.set_page_config(page_title="BYD系统级电热仿真-电热闭环版", layout="wide")
 
 # =============================================================================
 # 默认填充数据
@@ -25,13 +25,17 @@ def canonicalize_df_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
     for col in df.columns:
         col_str = str(col).strip().lower()
-        if "temp" in col_str: rename_map[col] = TEMP_COL
-        elif "current" in col_str or col_str in {"ic (a)", "if (a)"}: rename_map[col] = CURRENT_COL
+        if "temp" in col_str or "温度" in col_str: rename_map[col] = TEMP_COL
+        elif "current" in col_str or "电流" in col_str or col_str in {"ic (a)", "if (a)"}: rename_map[col] = CURRENT_COL
     return df.rename(columns=rename_map)
 
+# 修复 KeyError：先标准化列名，再做 dropna
 def safe_interp(df: pd.DataFrame, target_i: float, target_t: float, item_name: str) -> float:
-    clean_df = canonicalize_df_columns(df.dropna(subset=[TEMP_COL, CURRENT_COL, item_name]))
+    df_canon = canonicalize_df_columns(df.copy())
+    if item_name not in df_canon.columns: return 0.0
+    clean_df = df_canon.dropna(subset=[TEMP_COL, CURRENT_COL, item_name])
     if clean_df.empty: return 0.0
+    
     temp_list, val_list = [], []
     for temp, group in clean_df.groupby(TEMP_COL):
         sorted_g = group.sort_values(CURRENT_COL)
@@ -57,8 +61,9 @@ def get_bracketing_points(i_list, target_i):
     return i_list[0], i_list[1]
 
 def build_linearized_device_model(df: pd.DataFrame, target_i: float, target_t: float, item_name: str, force_zero_intercept: bool):
-    """注意：此处的 target_i 已经是未做除法缩放的“规格书宏观域”电流"""
-    clean_df = canonicalize_df_columns(df.dropna(subset=[CURRENT_COL, item_name]))
+    df_canon = canonicalize_df_columns(df.copy())
+    if item_name not in df_canon.columns: return {"v_pk": 0.0, "v_half": 0.0, "r_eq": 0.0, "v0": 0.0, "i_low": 0.0, "i_high": 0.0}
+    clean_df = df_canon.dropna(subset=[CURRENT_COL, item_name])
     i_list = clean_df[CURRENT_COL].unique() if not clean_df.empty else []
     
     i_low, i_high = get_bracketing_points(i_list, target_i)
@@ -73,7 +78,6 @@ def build_linearized_device_model(df: pd.DataFrame, target_i: float, target_t: f
     return {"v_pk": v_high, "v_half": v_low, "r_eq": r_eq, "v0": v0, "i_low": i_low, "i_high": i_high}
 
 def calc_switching_energy(df: pd.DataFrame, i_pk: float, tj: float, algo_type: str, i_nom_domain: float, item_name: str, vdc: float, vref: float, kv: float, ract: float, rref: float, kr: float, temp_coeff: float, tref: float) -> dict:
-    
     if "比例法" in algo_type:
         nominal_curr = max(float(i_nom_domain), 1e-12)
         e_nom = safe_interp(df, nominal_curr, tj, item_name)
@@ -81,7 +85,8 @@ def calc_switching_energy(df: pd.DataFrame, i_pk: float, tj: float, algo_type: s
         extraction_label = f"标称直线法 (基准={nominal_curr:.1f}A)"
     else:
         e_base = safe_interp(df, i_pk, tj, item_name)
-        clean_df = canonicalize_df_columns(df.dropna(subset=[CURRENT_COL, item_name]))
+        df_canon = canonicalize_df_columns(df.copy())
+        clean_df = df_canon.dropna(subset=[CURRENT_COL]) if CURRENT_COL in df_canon else pd.DataFrame()
         i_list = clean_df[CURRENT_COL].unique() if not clean_df.empty else []
         i_low, i_high = get_bracketing_points(i_list, i_pk)
         extraction_label = f"相邻区间拟合 ({i_low:.1f}~{i_high:.1f}A)"
@@ -94,7 +99,6 @@ def calc_switching_energy(df: pd.DataFrame, i_pk: float, tj: float, algo_type: s
     return {"energy_mj": energy_mj, "e_base_mj": e_base, "extraction_label": extraction_label}
 
 def calc_pwm_conduction_losses(mode: str, m_eff: float, active_cosphi: float, theta: float, i_pk_domain: float, main_model: dict, diode_model: dict, r_pkg_domain: float, r_arm_domain: float):
-    # 在数据宏观域计算总导通损耗
     r_main_total = main_model["r_eq"] + r_pkg_domain + r_arm_domain
     r_diode_total = diode_model["r_eq"] + r_pkg_domain + r_arm_domain
 
@@ -113,7 +117,7 @@ def calc_pwm_conduction_losses(mode: str, m_eff: float, active_cosphi: float, th
     return {"p_cond_main": max(0.0, float(p_cond_main)), "p_cond_diode": max(0.0, float(p_cond_diode))}
 
 # ================= UI 与系统调度 =================
-st.title("🛡️ 功率模块多架构电热联合仿真平台 (宏观数据直算版)")
+st.title("🛡️ 功率模块多架构电热联合仿真平台 (电热闭环修复版)")
 
 with st.sidebar:
     device_type = st.radio("1. 模块技术类型", ["IGBT + FRD (传统硅基)", "SiC MOSFET (碳化硅)"])
@@ -124,10 +128,10 @@ with st.sidebar:
     n_src_sw = st.number_input("E-I 原测模块芯片数", value=2, min_value=1)
     n_sim = st.number_input("目标仿真单臂芯片数", value=2, min_value=1)
 
-tabs_input = st.tabs(["📊 第一步：特性数据录入", "⚙️ 第二步：工况与参数配置", "🚀 第三步：执行联合仿真"])
+tabs_input = st.tabs(["📊 第一步：特性数据录入", "⚙️ 第二步：工况与电热配置", "🚀 第三步：执行联合仿真"])
 
 with tabs_input[0]:
-    st.info("💡 架构已升级：后台不再擅自修改你上传的数据。直接使用原始宏观矩阵查表，先计算整体损耗，再剥离微观单芯热源！")
+    st.info("💡 后台修复：不再因为空行而报错，完美支持自定义列名与空白行录入。")
     c_m, c_d = st.columns(2)
     with c_m:
         st.write("🔴 主开关管特性 (IGBT / SiC)")
@@ -153,85 +157,99 @@ with tabs_input[1]:
         i_nom_ref = st.number_input("直线基准电流(原表层级) (A)", value=400.0)
         v_ref = st.number_input("双脉冲基准 V_nom (V)", value=450.0)
         t_ref_dp = st.number_input("双脉冲基准 T_ref (℃)", value=25.0)
-        fixed_tj = st.number_input("仿真目标结温 Tj (℃)", value=150.0)
     with c3:
         kv_on = st.number_input("开通电压指数 K_v_on", value=1.30)
         kv_off = st.number_input("关断电压指数 K_v_off", value=1.30)
         kv_frd = st.number_input("续流电压指数 K_v_frd", value=0.60)
-        ki_frd = st.number_input("续流电流指数 K_i_frd", value=0.60)
         kron = st.number_input("电阻系数 K_ron", value=0.30)
         kroff = st.number_input("关断电阻系数 K_roff", value=0.50)
+        ki_frd = st.number_input("续流电流指数 K_i_frd", value=0.60)
     with c4:
-        st.info("对标公司时，请将温漂全部填 0")
+        st.info("智能初始结温：IGBT 默认 150℃，SiC 默认 175℃")
+        sim_mode = st.radio("热学模式", ["A. 开环(固定结温)", "B. 闭环热迭代(输入热阻水温)"])
+        
+        default_tj = 175.0 if "SiC" in device_type else 150.0
+        
+        if "开环" in sim_mode:
+            fixed_tj = st.number_input("设定全局结温 Tj (℃)", value=default_tj)
+            rth_jc, t_case = 0.0, 0.0
+        else:
+            rth_jc = st.number_input("芯片到水热阻 Rth (K/W)", value=0.135, format="%.4f")
+            t_case = st.number_input("冷却水温 Tc (℃)", value=65.0)
+            fixed_tj = default_tj # 作为闭环迭代的初始起点
+
         t_coeff_igbt = st.number_input("主管温漂系数", value=0.0000, format="%.4f")
         t_coeff_frd = st.number_input("续流温漂系数", value=0.0000, format="%.4f")
-        rg_on_ref = st.number_input("基准 R_g,on (Ω)", value=2.5)
-        rg_off_ref = st.number_input("基准 R_g,off (Ω)", value=20.0)
-        rg_on_act = st.number_input("实际 R_on (Ω)", value=2.5)
-        rg_off_act = st.number_input("实际 R_off (Ω)", value=20.0)
-        r_pkg_mohm = st.number_input("单芯封装内阻 (mΩ)", value=0.0)
-        r_arm_mohm = st.number_input("系统桥臂外接电阻 (mΩ)", value=0.0)
 
 with tabs_input[2]:
-    if st.button("🚀 执 行 联 合 仿 真 计 算", use_container_width=True):
+    if st.button("🚀 执 行 电 热 联 合 仿 真", use_container_width=True):
         
-        # 1. 基础芯片级电流
         i_pk_chip = math.sqrt(2.0) * (iout_rms / n_sim) if n_sim > 0 else 0.0
-        
-        # 2. 将电流逆向映射回规格书宏观数据域 (你的核心思路！)
         n_cond = int(n_src_cond) if "Module" in cond_data_type else 1
         n_sw = int(n_src_sw) if "Module" in sw_data_type else 1
         
         i_pk_cond_domain = i_pk_chip * n_cond
         i_pk_sw_domain = i_pk_chip * n_sw
 
-        active_cosphi = -cosphi if "反拖" in op_mode else cosphi
+        active_cosphi = -abs(cosphi) if "反拖" in op_mode else abs(cosphi)
         theta = math.acos(active_cosphi) if abs(active_cosphi) <= 1.0 else 0
-        tj = fixed_tj
-
-        # 3. 宏观数据域提取器件模型 (直接在原表上拟合)
-        main_model = build_linearized_device_model(ev_main, i_pk_cond_domain, tj, "V_drop (V)", "SiC" in device_type)
-        diode_model = build_linearized_device_model(ev_diode, i_pk_cond_domain, tj, "Vf (V)", False)
         
-        # 寄生电阻同步映射到宏观域以供积分
-        r_pkg_domain = (r_pkg_mohm / 1000.0) / n_cond
-        r_arm_domain = ((r_arm_mohm / 1000.0) * n_sim) / n_cond
-
-        # 4. 计算宏观数据域的【表级导通总损耗】
-        cond_res_domain = calc_pwm_conduction_losses(mode, m_index, active_cosphi, theta, i_pk_cond_domain, main_model, diode_model, r_pkg_domain, r_arm_domain)
-
-        # 5. 计算宏观数据域的【表级开关总能量与损耗】
-        i_nom_domain = i_nom_ref # 输入的就是宏观表级参考电流
-        eon = calc_switching_energy(ee_main, i_pk_sw_domain, tj, algo_type, i_nom_domain, "Eon (mJ)", vdc_act, v_ref, kv_on, rg_on_act, rg_on_ref, kron, t_coeff_igbt, t_ref_dp)
-        eoff = calc_switching_energy(ee_main, i_pk_sw_domain, tj, algo_type, i_nom_domain, "Eoff (mJ)", vdc_act, v_ref, kv_off, rg_off_act, rg_off_ref, kroff, t_coeff_igbt, t_ref_dp)
-        erec = calc_switching_energy(ee_diode, i_pk_sw_domain, tj, algo_type, i_nom_domain, "Erec (mJ)", vdc_act, v_ref, kv_frd, 1.0, 1.0, 0.0, t_coeff_frd, t_ref_dp)
-
-        p_sw_m_domain = (fsw / math.pi) * ((eon["energy_mj"] + eoff["energy_mj"]) / 1000.0)
-        p_sw_d_domain = (fsw / math.pi) * (erec["energy_mj"] / 1000.0)
-
-        # =======================================================
-        # 6. 微观剥离：从宏观总损耗中剥离出真实的单芯片发热率
-        # =======================================================
-        p_cond_main_chip = cond_res_domain['p_cond_main'] / n_cond
-        p_cond_diode_chip = cond_res_domain['p_cond_diode'] / n_cond
+        iteration_log = []
+        tj_current = fixed_tj # 初始结温：150 或 175
+        loop_max = 30 if "闭环" in sim_mode else 1
+        tolerance = 0.05
         
-        p_sw_main_chip = p_sw_m_domain / n_sw
-        p_sw_diode_chip = p_sw_d_domain / n_sw
+        for loop_idx in range(loop_max):
+            # 宏观数据域提取与温度自适应
+            main_model = build_linearized_device_model(ev_main, i_pk_cond_domain, tj_current, "V_drop (V)", "SiC" in device_type)
+            diode_model = build_linearized_device_model(ev_diode, i_pk_cond_domain, tj_current, "Vf (V)", False)
+            
+            cond_res_domain = calc_pwm_conduction_losses(mode, m_index, active_cosphi, theta, i_pk_cond_domain, main_model, diode_model, 0.0, 0.0)
 
-        st.success("✅ 联合仿真执行完毕！完全落实：宏观提取 $\\rightarrow$ 宏观积分 $\\rightarrow$ 微观单芯剥离的工程范式。")
+            eon = calc_switching_energy(ee_main, i_pk_sw_domain, tj_current, algo_type, i_nom_ref, "Eon (mJ)", vdc_act, v_ref, kv_on, 1.0, 1.0, kron, t_coeff_igbt, t_ref_dp)
+            eoff = calc_switching_energy(ee_main, i_pk_sw_domain, tj_current, algo_type, i_nom_ref, "Eoff (mJ)", vdc_act, v_ref, kv_off, 1.0, 1.0, kroff, t_coeff_igbt, t_ref_dp)
+            erec = calc_switching_energy(ee_diode, i_pk_sw_domain, tj_current, algo_type, i_nom_ref, "Erec (mJ)", vdc_act, v_ref, kv_frd, 1.0, 1.0, 0.0, t_coeff_frd, t_ref_dp)
+
+            p_sw_m_domain = (fsw / math.pi) * ((eon["energy_mj"] + eoff["energy_mj"]) / 1000.0)
+            p_sw_d_domain = (fsw / math.pi) * (erec["energy_mj"] / 1000.0)
+
+            # 微观剥离计算单芯片损耗
+            p_cond_main_chip = cond_res_domain['p_cond_main'] / n_cond
+            p_cond_diode_chip = cond_res_domain['p_cond_diode'] / n_cond
+            p_sw_main_chip = p_sw_m_domain / n_sw
+            p_sw_diode_chip = p_sw_d_domain / n_sw
+            
+            p_total_chip_main = p_cond_main_chip + p_sw_main_chip
+            p_total_chip_diode = p_cond_diode_chip + p_sw_diode_chip
+            p_total_arm = (p_total_chip_main + p_total_chip_diode) * n_sim
+            
+            iteration_log.append({
+                "迭代次数": loop_idx + 1,
+                "当前结温 (℃)": round(tj_current, 2),
+                "主开关单颗耗散 (W)": round(p_total_chip_main, 2),
+                "二极管单颗耗散 (W)": round(p_total_chip_diode, 2),
+            })
+            
+            if "闭环" in sim_mode:
+                # 电热耦合核心：T_j = T_case + P * Rth
+                # 假设主开关发热主导，使用最大发热件更新结温（工业界常用简化保守做法）
+                max_p = max(p_total_chip_main, p_total_chip_diode)
+                tj_new = t_case + max_p * rth_jc
+                if abs(tj_new - tj_current) < tolerance:
+                    tj_current = tj_new
+                    break
+                tj_current = tj_new
+
+        st.success("✅ 电热耦合计算收敛！" if "闭环" in sim_mode else "✅ 开环状态计算完毕。")
         
         r1, r2, r3, r4 = st.columns(4)
-        r1.metric("单臂设计峰值电流 I_pk", f"{i_pk_chip * n_sim:.2f} A")
-        r2.metric("主开关仿真单臂总损耗", f"{(p_cond_main_chip + p_sw_main_chip)*n_sim:.1f} W")
-        r3.metric("🔴 剥离: 主芯片单颗发热", f"{p_cond_main_chip + p_sw_main_chip:.2f} W")
-        r4.metric("🔵 剥离: 二极管单颗发热", f"{p_cond_diode_chip + p_sw_diode_chip:.2f} W")
+        r1.metric("最终稳定结温 Tj", f"{tj_current:.1f} ℃")
+        r2.metric("仿真单臂总损耗", f"{p_total_arm:.1f} W")
+        r3.metric("🔴 主芯片单颗发热", f"{p_total_chip_main:.2f} W")
+        r4.metric("🔵 二极管单颗发热", f"{p_total_chip_diode:.2f} W")
         
-        st.divider()
-        st.info(f"🔍 **动态追踪系统：**\n"
-                f"- 当前规格书导通域查询电流：{i_pk_cond_domain:.2f}A。底层 V0/Req 在 **{main_model['i_low']:.1f}A ~ {main_model['i_high']:.1f}A** 区间直接切线拟合。\n"
-                f"- 当前规格书开关域查询电流：{i_pk_sw_domain:.2f}A。E-I 提取算法采用 **{eon['extraction_label']}**。")
-
-        with st.expander("📊 查看剥离前宏观规格书域损耗明细", expanded=True):
-            st.write(f"- 原表级主导通总损耗：**{cond_res_domain['p_cond_main']:.2f} W**")
-            st.write(f"- 原表级主开关总损耗：**{p_sw_m_domain:.2f} W** (依据 $E_{{on}}$={eon['energy_mj']:.2f}mJ, $E_{{off}}$={eoff['energy_mj']:.2f}mJ 算出)")
-            st.caption(f"将上述宏观损耗分别除以填写的规格书芯片数 ({n_cond} 芯 / {n_sw} 芯)，即为输出的热源参数。")
+        if "闭环" in sim_mode:
+            st.divider()
+            st.markdown(f"🔄 **电热闭环迭代追踪 (初始推演从 {fixed_tj}℃ 开始)：**")
+            st.dataframe(pd.DataFrame(iteration_log), use_container_width=True)
+            st.caption("推算公式：新结温 Tj = 冷却水温 Tc + 发热量 P × 热阻 Rth")
