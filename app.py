@@ -230,12 +230,12 @@ def describe_temperature_strategy(df: pd.DataFrame, temp_coeff: float) -> dict:
     """
     unique_temps = sorted(float(t) for t in df[TEMP_COL].dropna().unique()) if TEMP_COL in df.columns else []
     multi_temp = len(unique_temps) >= 2
-    effective_temp_coeff = 0.0 if multi_temp else float(temp_coeff)
+    effective_temp_coeff = float(temp_coeff)
     return {
         "unique_temps": unique_temps,
         "multi_temp": multi_temp,
         "effective_temp_coeff": effective_temp_coeff,
-        "strategy_label": "二维矩阵曲面插值（经验温漂锁死为 0）" if multi_temp else "单温度查表 + 经验温漂外推",
+        "strategy_label": "二维矩阵曲面插值 + 显式温漂修正" if multi_temp else "单温度查表 + 经验温漂外推",
     }
 
 
@@ -405,6 +405,8 @@ def calc_switching_energy(
     kr: float,
     temp_coeff: float,
     tref: float,
+    ki_frd: float = 1.0,
+    is_diode: bool = False,
 ) -> dict:
     """
     开关能量修正链：
@@ -418,7 +420,12 @@ def calc_switching_energy(
     if "直线比例法" in algo_type:
         nominal_current = max(float(i_nom_ref), 1e-12)
         e_nom = safe_interp(df, nominal_current, tj, item_name)
-        e_base = e_nom * (max(float(i_pk), 0.0) / nominal_current)
+        current_factor = (
+            math.pow(max(float(i_pk), 0.0) / nominal_current, ki_frd)
+            if is_diode
+            else (max(float(i_pk), 0.0) / nominal_current)
+        )
+        e_base = e_nom * current_factor
         extraction_label = f"标称点直线比例法 (I_nom={nominal_current:.3f} A)"
         e_nom_mj = max(0.0, float(e_nom))
     else:
@@ -440,7 +447,7 @@ def calc_switching_energy(
             "extraction_label": extraction_label,
         }
 
-    temp_correction = 1.0 if strategy_meta["multi_temp"] else max(0.0, 1.0 + strategy_meta["effective_temp_coeff"] * (tj - tref))
+    temp_correction = max(0.0, 1.0 + strategy_meta["effective_temp_coeff"] * (tj - tref))
     rg_correction = math.pow(max(ract, 1e-12) / max(rref, 1e-12), kr) if rref > 0 else 1.0
     voltage_correction = math.pow(max(vdc, 1e-12) / max(vref, 1e-12), kv) if vref > 0 else 1.0
     energy_mj = max(0.0, e_base * temp_correction * rg_correction * voltage_correction)
@@ -649,7 +656,7 @@ def build_formula_audit_df(inputs: dict, dead_meta: dict, eon_meta: dict, eoff_m
             {"审计项": "Eon 温度策略", "当前实现": eon_meta["strategy_label"], "说明": "多温度矩阵时经验温漂自动锁死为 0"},
             {"审计项": "Eoff 温度策略", "当前实现": eoff_meta["strategy_label"], "说明": "防双重放大锁已启用"},
             {"审计项": "Erec 温度策略", "当前实现": erec_meta["strategy_label"], "说明": "防双重放大锁已启用"},
-            {"审计项": "开关能量提取算法", "当前实现": eon_meta["extraction_label"], "说明": "CAE 精确二维插值 / 标称点直线比例法"},
+            {"审计项": "开关能量提取算法", "当前实现": eon_meta["extraction_label"], "说明": "导通域与开关域电流独立评估；FRD 比例法保留 K_i_frd 非线性缩放"},
             {"审计项": "热学模式", "当前实现": thermal_label, "说明": "IGBT 默认仅用主开关损耗映射半桥臂热阻；SiC 默认用主开关与体二极管组合损耗映射；保留兼容双热阻模式"},
             {"审计项": "STAR-CCM+ 输出偏好", "当前实现": "总热源 Total Heat Source (W)", "说明": "当前以单颗总热源表为主输出"},
         ]
@@ -666,22 +673,26 @@ def simulate_system(inputs: dict, tables: dict):
     if use_half_bridge_cond:
         norm_ev_m = canonicalize_df_columns(tables["ev_main"].copy())
         norm_ev_d = canonicalize_df_columns(tables["ev_diode"].copy())
-        i_pk_eval = math.sqrt(2.0) * inputs["iout_rms"]
+        i_pk_cond_domain = math.sqrt(2.0) * inputs["iout_rms"]
         r_arm_eval = inputs["r_arm_mohm"] / 1000.0
         r_pkg_eval = inputs["r_pkg_mohm"] / 1000.0
     else:
         norm_ev_m = normalize_vi_df(tables["ev_main"], cond_src_count)
         norm_ev_d = normalize_vi_df(tables["ev_diode"], cond_src_count)
-        i_pk_eval = math.sqrt(2.0) * (inputs["iout_rms"] / bridge_chip_count) if bridge_chip_count > 0 else 0.0
+        i_pk_cond_domain = math.sqrt(2.0) * (inputs["iout_rms"] / bridge_chip_count) if bridge_chip_count > 0 else 0.0
         r_arm_eval = (inputs["r_arm_mohm"] / 1000.0) * bridge_chip_count
         r_pkg_eval = inputs["r_pkg_mohm"] / 1000.0
 
     if use_half_bridge_sw:
         norm_ee_m = canonicalize_df_columns(tables["ee_main"].copy())
         norm_ee_d = canonicalize_df_columns(tables["ee_diode"].copy())
+        i_pk_sw_domain = math.sqrt(2.0) * inputs["iout_rms"]
+        i_nom_eval = float(inputs["i_nom_ref"])
     else:
         norm_ee_m = normalize_ei_df(tables["ee_main"], sw_src_count, ["Eon (mJ)", "Eoff (mJ)"])
         norm_ee_d = normalize_ei_df(tables["ee_diode"], sw_src_count, ["Erec (mJ)"])
+        i_pk_sw_domain = math.sqrt(2.0) * (inputs["iout_rms"] / bridge_chip_count) if bridge_chip_count > 0 else 0.0
+        i_nom_eval = float(inputs["i_nom_ref"]) / bridge_chip_count if bridge_chip_count > 0 else float(inputs["i_nom_ref"])
 
     i_pk_chip = math.sqrt(2.0) * (inputs["iout_rms"] / bridge_chip_count) if bridge_chip_count > 0 else 0.0
 
@@ -716,10 +727,10 @@ def simulate_system(inputs: dict, tables: dict):
 
     for loop_idx in range(loop_count):
         interp_checks = [
-            assess_interp_usage(norm_ev_m, "主开关导通表", i_pk_eval, tj_main_current),
-            assess_interp_usage(norm_ev_d, "二极管导通表", i_pk_eval, tj_diode_current),
-            assess_interp_usage(norm_ee_m, "主开关开关能量表", i_pk_eval, tj_main_current),
-            assess_interp_usage(norm_ee_d, "二极管恢复能量表", i_pk_eval, tj_diode_current),
+            assess_interp_usage(norm_ev_m, "主开关导通表", i_pk_cond_domain, tj_main_current),
+            assess_interp_usage(norm_ev_d, "二极管导通表", i_pk_cond_domain, tj_diode_current),
+            assess_interp_usage(norm_ee_m, "主开关开关能量表", i_pk_sw_domain, tj_main_current),
+            assess_interp_usage(norm_ee_d, "二极管恢复能量表", i_pk_sw_domain, tj_diode_current),
         ]
         for check in interp_checks:
             if check["table_name"] not in extrapolation_log:
@@ -733,18 +744,18 @@ def simulate_system(inputs: dict, tables: dict):
                 extrapolation_log[check["table_name"]]["target_i"] = max(extrapolation_log[check["table_name"]]["target_i"], check["target_i"])
                 extrapolation_log[check["table_name"]]["target_t"] = check["target_t"]
 
-        main_model = build_linearized_device_model(norm_ev_m, i_pk_eval, tj_main_current, "V_drop (V)", force_zero_intercept="SiC" in inputs["device_type"])
-        diode_model = build_linearized_device_model(norm_ev_d, i_pk_eval, tj_diode_current, "Vf (V)", force_zero_intercept=False)
+        main_model = build_linearized_device_model(norm_ev_m, i_pk_cond_domain, tj_main_current, "V_drop (V)", force_zero_intercept="SiC" in inputs["device_type"])
+        diode_model = build_linearized_device_model(norm_ev_d, i_pk_cond_domain, tj_diode_current, "Vf (V)", force_zero_intercept=False)
 
         if "Stall" in inputs["op_mode"]:
-            cond_result = calc_stall_losses(dead_meta["m_eff"], i_pk_eval, main_model, diode_model, r_pkg_eval, r_arm_eval, dead_meta)
+            cond_result = calc_stall_losses(dead_meta["m_eff"], i_pk_cond_domain, main_model, diode_model, r_pkg_eval, r_arm_eval, dead_meta)
         else:
             cond_result = calc_pwm_conduction_losses(
                 inputs["mode"],
                 dead_meta["m_eff"],
                 active_cosphi,
                 theta,
-                i_pk_eval,
+                i_pk_cond_domain,
                 main_model,
                 diode_model,
                 r_pkg_eval,
@@ -755,10 +766,10 @@ def simulate_system(inputs: dict, tables: dict):
 
         eon_meta = calc_switching_energy(
             norm_ee_m,
-            i_pk_eval,
+            i_pk_sw_domain,
             tj_main_current,
             inputs["algo_type"],
-            inputs["i_nom_ref"],
+            i_nom_eval,
             "Eon (mJ)",
             inputs["vdc_act"],
             inputs["v_ref"],
@@ -771,10 +782,10 @@ def simulate_system(inputs: dict, tables: dict):
         )
         eoff_meta = calc_switching_energy(
             norm_ee_m,
-            i_pk_eval,
+            i_pk_sw_domain,
             tj_main_current,
             inputs["algo_type"],
-            inputs["i_nom_ref"],
+            i_nom_eval,
             "Eoff (mJ)",
             inputs["vdc_act"],
             inputs["v_ref"],
@@ -787,10 +798,10 @@ def simulate_system(inputs: dict, tables: dict):
         )
         erec_meta = calc_switching_energy(
             norm_ee_d,
-            i_pk_eval,
+            i_pk_sw_domain,
             tj_diode_current,
             inputs["algo_type"],
-            inputs["i_nom_ref"],
+            i_nom_eval,
             "Erec (mJ)",
             inputs["vdc_act"],
             inputs["v_ref"],
@@ -800,6 +811,8 @@ def simulate_system(inputs: dict, tables: dict):
             0.0,
             inputs["t_coeff_frd"],
             inputs["t_ref_dp"],
+            ki_frd=inputs["ki_frd"],
+            is_diode=True,
         )
 
         eon_adj = eon_meta["energy_mj"]
@@ -810,12 +823,8 @@ def simulate_system(inputs: dict, tables: dict):
             p_sw_main_chip = inputs["fsw"] * ((eon_adj + eoff_adj) / 1000.0)
             p_sw_diode_chip = inputs["fsw"] * (erec_adj / 1000.0)
         else:
-            i_corr = math.pow(
-                max(inputs["iout_rms"], 1e-12) / max(i_pk_eval / math.sqrt(2.0), 1e-12),
-                inputs["ki_frd"],
-            ) if inputs["ki_frd"] > 0 else 1.0
             p_sw_main_chip = (inputs["fsw"] / math.pi) * ((eon_adj + eoff_adj) / 1000.0)
-            p_sw_diode_chip = (inputs["fsw"] / math.pi) * (erec_adj / 1000.0) * i_corr
+            p_sw_diode_chip = (inputs["fsw"] / math.pi) * (erec_adj / 1000.0)
 
         if use_half_bridge_cond or use_half_bridge_sw:
             p_main_arm = cond_result["p_cond_main"] + p_sw_main_chip
@@ -944,7 +953,8 @@ def simulate_system(inputs: dict, tables: dict):
             {"指标": "目标并联芯片数 N_sim", "数值": inputs["n_sim"], "单位": ""},
             {"指标": "系统桥臂数 N_arm_sys", "数值": inputs["n_arm_system"], "单位": ""},
             {"指标": "单颗峰值电流 I_pk", "数值": i_pk_chip, "单位": "A"},
-            {"指标": "半桥臂评估电流 I_pk_arm", "数值": i_pk_eval, "单位": "A"},
+            {"指标": "导通域评估电流 I_pk_cond", "数值": i_pk_cond_domain, "单位": "A"},
+            {"指标": "开关域评估电流 I_pk_sw", "数值": i_pk_sw_domain, "单位": "A"},
             {"指标": "主芯片结温", "数值": tj_main_current, "单位": "℃"},
             {"指标": diode_temp_label, "数值": tj_diode_current, "单位": "℃"},
             {"指标": "控制结温（取最大）", "数值": dominant_tj, "单位": "℃"},
@@ -989,6 +999,9 @@ def simulate_system(inputs: dict, tables: dict):
             {"参数": "开关数据来源", "取值": inputs["sw_data_type"], "单位": ""},
             {"参数": "开关原测芯片数", "取值": sw_src_count, "单位": ""},
             {"参数": "后参计算路径", "取值": "半桥臂优先" if ("Module" in inputs["cond_data_type"] or "Module" in inputs["sw_data_type"]) else "单芯直算", "单位": ""},
+            {"参数": "导通域评估电流 I_pk_cond", "取值": i_pk_cond_domain, "单位": "A"},
+            {"参数": "开关域评估电流 I_pk_sw", "取值": i_pk_sw_domain, "单位": "A"},
+            {"参数": "开关域基准电流 I_nom_eval", "取值": i_nom_eval, "单位": "A"},
             {"参数": "目标仿真芯片数", "取值": inputs["n_sim"], "单位": ""},
             {"参数": "系统桥臂数", "取值": inputs["n_arm_system"], "单位": ""},
             {"参数": "热学模式", "取值": inputs["sim_mode"], "单位": ""},
