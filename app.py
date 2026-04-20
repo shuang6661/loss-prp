@@ -154,6 +154,12 @@ def validate_scalar_inputs(inputs: dict):
         if inputs["rth_jc_main"] < 0 or inputs["rth_jc_diode"] < 0:
             errors.append("闭环模式下，RthJC_main 与 RthJC_diode 都不能为负数。")
 
+    if "sim_mode" in inputs and "diode_coupling_factor" in inputs and "闭环" in inputs["sim_mode"]:
+        if not 0.0 <= inputs["diode_coupling_factor"] <= 1.5:
+            errors.append("Diode coupling factor must be between 0.0 and 1.5.")
+        if inputs["diode_self_heating_factor"] < 0.0:
+            errors.append("Diode self-heating factor must be non-negative.")
+
     if inputs["r_pkg_mohm"] == 0 and inputs["r_arm_mohm"] == 0:
         warnings.append("当前默认未额外计入封装内阻和外部电路电阻，等价假设这些寄生压降已包含在原始 V-I 数据中。")
     if inputs["fsw"] == 0:
@@ -166,6 +172,54 @@ def validate_scalar_inputs(inputs: dict):
             warnings.append("死区时间相对于开关周期偏大，死区补偿会显著改变有效占空比。")
 
     return errors, warnings
+
+
+def calc_coupled_junction_temperatures(inputs: dict, p_main_chip: float, p_diode_chip: float) -> tuple[float, float, dict]:
+    thermal_model = inputs.get("thermal_model", "main_rth_coupled")
+    if thermal_model == "dual_rth_independent":
+        tj_main_new = inputs["t_case_main"] + p_main_chip * inputs["rth_jc_main"]
+        tj_diode_new = inputs["t_case_diode"] + p_diode_chip * inputs["rth_jc_diode"]
+        thermal_meta = {
+            "thermal_model": thermal_model,
+            "shared_case_temp": np.nan,
+            "main_rise": tj_main_new - inputs["t_case_main"],
+            "diode_coupled_rise": 0.0,
+            "diode_self_rise": tj_diode_new - inputs["t_case_diode"],
+            "driving_power_w": p_main_chip,
+        }
+        return tj_main_new, tj_diode_new, thermal_meta
+
+    if thermal_model == "half_bridge_main_reference":
+        shared_case_temp = inputs["t_case_main"]
+        driving_power = p_main_chip + p_diode_chip if "SiC" in inputs["device_type"] else p_main_chip
+        arm_total_rise = driving_power * inputs["rth_jc_main"]
+        tj_main_new = shared_case_temp + arm_total_rise
+        tj_diode_new = tj_main_new if "SiC" in inputs["device_type"] else shared_case_temp + arm_total_rise
+        thermal_meta = {
+            "thermal_model": thermal_model,
+            "shared_case_temp": shared_case_temp,
+            "main_rise": arm_total_rise,
+            "diode_coupled_rise": arm_total_rise,
+            "diode_self_rise": 0.0,
+            "driving_power_w": driving_power,
+        }
+        return tj_main_new, tj_diode_new, thermal_meta
+
+    shared_case_temp = inputs["t_case_main"]
+    main_rise = p_main_chip * inputs["rth_jc_main"]
+    diode_coupled_rise = main_rise * inputs["diode_coupling_factor"]
+    diode_self_rise = p_diode_chip * inputs["rth_jc_main"] * inputs["diode_self_heating_factor"]
+    tj_main_new = shared_case_temp + main_rise
+    tj_diode_new = shared_case_temp + diode_coupled_rise + diode_self_rise
+    thermal_meta = {
+        "thermal_model": thermal_model,
+        "shared_case_temp": shared_case_temp,
+        "main_rise": main_rise,
+        "diode_coupled_rise": diode_coupled_rise,
+        "diode_self_rise": diode_self_rise,
+        "driving_power_w": p_main_chip,
+    }
+    return tj_main_new, tj_diode_new, thermal_meta
 
 
 def describe_temperature_strategy(df: pd.DataFrame, temp_coeff: float) -> dict:
@@ -445,6 +499,7 @@ def calc_pwm_conduction_losses(
     r_pkg_chip: float,
     r_arm_chip: float,
     dead_meta: dict,
+    is_sic: bool = False,
 ):
     """
     PWM 导通损耗：
@@ -472,10 +527,13 @@ def calc_pwm_conduction_losses(
         p_cond_main = (kv0_m * main_model["v0"] * i_pk_chip) + (kr_m * r_main_total * i_pk_chip**2) / math.pi
         p_cond_diode = (kv0_d * diode_model["v0"] * i_pk_chip) / math.pi + (kr_d * r_diode_total * i_pk_chip**2) / math.pi
     else:
-        p_cond_main = (
-            main_model["v0"] * i_pk_chip * (1.0 / (2.0 * math.pi) + m_eff * active_cosphi / 8.0)
-            + r_main_total * i_pk_chip**2 * (1.0 / 8.0 + m_eff * active_cosphi / (3.0 * math.pi))
-        )
+        if is_sic:
+            p_cond_main = r_main_total * i_pk_chip**2 * (1.0 / 8.0 + m_eff * active_cosphi / (3.0 * math.pi))
+        else:
+            p_cond_main = (
+                main_model["v0"] * i_pk_chip * (1.0 / (2.0 * math.pi) + m_eff * active_cosphi / 8.0)
+                + r_main_total * i_pk_chip**2 * (1.0 / 8.0 + m_eff * active_cosphi / (3.0 * math.pi))
+            )
         p_cond_diode = (
             diode_model["v0"] * i_pk_chip * (1.0 / (2.0 * math.pi) - m_eff * active_cosphi / 8.0)
             + r_diode_total * i_pk_chip**2 * (1.0 / 8.0 - m_eff * active_cosphi / (3.0 * math.pi))
@@ -586,12 +644,13 @@ def build_formula_audit_df(inputs: dict, dead_meta: dict, eon_meta: dict, eoff_m
             {"审计项": "调制解析式", "当前实现": mode_label, "说明": "保留原始工程积分框架，死区修正体现在 M_eff"},
             {"审计项": "主开关导通模型", "当前实现": "SiC 纯阻性锁 ON" if sic_lock_active else "IGBT 的 V0 + R 线性化", "说明": "SiC 主开关强制 V0 = 0"},
             {"审计项": "续流路径模型", "当前实现": "Vf0 + R 线性化", "说明": "续流二极管保留压降项"},
+            {"审计项": "单芯/半桥换算路径", "当前实现": "半桥臂后参优先，先算半桥臂再折算单芯", "说明": "仅在 Bare Die 数据路径下直接按单芯坐标计算"},
             {"审计项": "死区补偿", "当前实现": f"启用，M_eff = {dead_meta['m_eff']:.6f}" if dead_meta["dead_ratio"] > 0 else "关闭", "说明": "同时修正有效调制系数和导通路径分配"},
             {"审计项": "Eon 温度策略", "当前实现": eon_meta["strategy_label"], "说明": "多温度矩阵时经验温漂自动锁死为 0"},
             {"审计项": "Eoff 温度策略", "当前实现": eoff_meta["strategy_label"], "说明": "防双重放大锁已启用"},
             {"审计项": "Erec 温度策略", "当前实现": erec_meta["strategy_label"], "说明": "防双重放大锁已启用"},
             {"审计项": "开关能量提取算法", "当前实现": eon_meta["extraction_label"], "说明": "CAE 精确二维插值 / 标称点直线比例法"},
-            {"审计项": "热学模式", "当前实现": thermal_label, "说明": "主芯片与二极管按各自单颗损耗迭代"},
+            {"审计项": "热学模式", "当前实现": thermal_label, "说明": "IGBT 默认仅用主开关损耗映射半桥臂热阻；SiC 默认用主开关与体二极管组合损耗映射；保留兼容双热阻模式"},
             {"审计项": "STAR-CCM+ 输出偏好", "当前实现": "总热源 Total Heat Source (W)", "说明": "当前以单颗总热源表为主输出"},
         ]
     )
@@ -600,15 +659,31 @@ def build_formula_audit_df(inputs: dict, dead_meta: dict, eon_meta: dict, eoff_m
 def simulate_system(inputs: dict, tables: dict):
     cond_src_count = inputs["n_src_cond"] if "Module" in inputs["cond_data_type"] else 1
     sw_src_count = inputs["n_src_sw"] if "Module" in inputs["sw_data_type"] else 1
+    use_half_bridge_cond = "Module" in inputs["cond_data_type"]
+    use_half_bridge_sw = "Module" in inputs["sw_data_type"]
+    bridge_chip_count = max(inputs["n_sim"], 1)
 
-    norm_ev_m = normalize_vi_df(tables["ev_main"], cond_src_count)
-    norm_ev_d = normalize_vi_df(tables["ev_diode"], cond_src_count)
-    norm_ee_m = normalize_ei_df(tables["ee_main"], sw_src_count, ["Eon (mJ)", "Eoff (mJ)"])
-    norm_ee_d = normalize_ei_df(tables["ee_diode"], sw_src_count, ["Erec (mJ)"])
+    if use_half_bridge_cond:
+        norm_ev_m = canonicalize_df_columns(tables["ev_main"].copy())
+        norm_ev_d = canonicalize_df_columns(tables["ev_diode"].copy())
+        i_pk_eval = math.sqrt(2.0) * inputs["iout_rms"]
+        r_arm_eval = inputs["r_arm_mohm"] / 1000.0
+        r_pkg_eval = inputs["r_pkg_mohm"] / 1000.0
+    else:
+        norm_ev_m = normalize_vi_df(tables["ev_main"], cond_src_count)
+        norm_ev_d = normalize_vi_df(tables["ev_diode"], cond_src_count)
+        i_pk_eval = math.sqrt(2.0) * (inputs["iout_rms"] / bridge_chip_count) if bridge_chip_count > 0 else 0.0
+        r_arm_eval = (inputs["r_arm_mohm"] / 1000.0) * bridge_chip_count
+        r_pkg_eval = inputs["r_pkg_mohm"] / 1000.0
 
-    i_pk_chip = math.sqrt(2.0) * (inputs["iout_rms"] / inputs["n_sim"]) if inputs["n_sim"] > 0 else 0.0
-    r_arm_chip = (inputs["r_arm_mohm"] / 1000.0) * inputs["n_sim"]
-    r_pkg_chip = inputs["r_pkg_mohm"] / 1000.0
+    if use_half_bridge_sw:
+        norm_ee_m = canonicalize_df_columns(tables["ee_main"].copy())
+        norm_ee_d = canonicalize_df_columns(tables["ee_diode"].copy())
+    else:
+        norm_ee_m = normalize_ei_df(tables["ee_main"], sw_src_count, ["Eon (mJ)", "Eoff (mJ)"])
+        norm_ee_d = normalize_ei_df(tables["ee_diode"], sw_src_count, ["Erec (mJ)"])
+
+    i_pk_chip = math.sqrt(2.0) * (inputs["iout_rms"] / bridge_chip_count) if bridge_chip_count > 0 else 0.0
 
     active_cosphi = -abs(inputs["cosphi"]) if "Regeneration" in inputs["op_mode"] else abs(inputs["cosphi"])
     active_cosphi = clamp(active_cosphi, -1.0, 1.0)
@@ -631,13 +706,20 @@ def simulate_system(inputs: dict, tables: dict):
 
     iteration_rows = []
     extrapolation_log: dict[str, dict] = {}
+    thermal_meta = {
+        "thermal_model": inputs.get("thermal_model", ""),
+        "shared_case_temp": np.nan,
+        "main_rise": np.nan,
+        "diode_coupled_rise": np.nan,
+        "diode_self_rise": np.nan,
+    }
 
     for loop_idx in range(loop_count):
         interp_checks = [
-            assess_interp_usage(norm_ev_m, "主开关导通表", i_pk_chip, tj_main_current),
-            assess_interp_usage(norm_ev_d, "二极管导通表", i_pk_chip, tj_diode_current),
-            assess_interp_usage(norm_ee_m, "主开关开关能量表", i_pk_chip, tj_main_current),
-            assess_interp_usage(norm_ee_d, "二极管恢复能量表", i_pk_chip, tj_diode_current),
+            assess_interp_usage(norm_ev_m, "主开关导通表", i_pk_eval, tj_main_current),
+            assess_interp_usage(norm_ev_d, "二极管导通表", i_pk_eval, tj_diode_current),
+            assess_interp_usage(norm_ee_m, "主开关开关能量表", i_pk_eval, tj_main_current),
+            assess_interp_usage(norm_ee_d, "二极管恢复能量表", i_pk_eval, tj_diode_current),
         ]
         for check in interp_checks:
             if check["table_name"] not in extrapolation_log:
@@ -651,17 +733,29 @@ def simulate_system(inputs: dict, tables: dict):
                 extrapolation_log[check["table_name"]]["target_i"] = max(extrapolation_log[check["table_name"]]["target_i"], check["target_i"])
                 extrapolation_log[check["table_name"]]["target_t"] = check["target_t"]
 
-        main_model = build_linearized_device_model(norm_ev_m, i_pk_chip, tj_main_current, "V_drop (V)", force_zero_intercept="SiC" in inputs["device_type"])
-        diode_model = build_linearized_device_model(norm_ev_d, i_pk_chip, tj_diode_current, "Vf (V)", force_zero_intercept=False)
+        main_model = build_linearized_device_model(norm_ev_m, i_pk_eval, tj_main_current, "V_drop (V)", force_zero_intercept="SiC" in inputs["device_type"])
+        diode_model = build_linearized_device_model(norm_ev_d, i_pk_eval, tj_diode_current, "Vf (V)", force_zero_intercept=False)
 
         if "Stall" in inputs["op_mode"]:
-            cond_result = calc_stall_losses(dead_meta["m_eff"], i_pk_chip, main_model, diode_model, r_pkg_chip, r_arm_chip, dead_meta)
+            cond_result = calc_stall_losses(dead_meta["m_eff"], i_pk_eval, main_model, diode_model, r_pkg_eval, r_arm_eval, dead_meta)
         else:
-            cond_result = calc_pwm_conduction_losses(inputs["mode"], dead_meta["m_eff"], active_cosphi, theta, i_pk_chip, main_model, diode_model, r_pkg_chip, r_arm_chip, dead_meta)
+            cond_result = calc_pwm_conduction_losses(
+                inputs["mode"],
+                dead_meta["m_eff"],
+                active_cosphi,
+                theta,
+                i_pk_eval,
+                main_model,
+                diode_model,
+                r_pkg_eval,
+                r_arm_eval,
+                dead_meta,
+                is_sic="SiC" in inputs["device_type"],
+            )
 
         eon_meta = calc_switching_energy(
             norm_ee_m,
-            i_pk_chip,
+            i_pk_eval,
             tj_main_current,
             inputs["algo_type"],
             inputs["i_nom_ref"],
@@ -677,7 +771,7 @@ def simulate_system(inputs: dict, tables: dict):
         )
         eoff_meta = calc_switching_energy(
             norm_ee_m,
-            i_pk_chip,
+            i_pk_eval,
             tj_main_current,
             inputs["algo_type"],
             inputs["i_nom_ref"],
@@ -693,7 +787,7 @@ def simulate_system(inputs: dict, tables: dict):
         )
         erec_meta = calc_switching_energy(
             norm_ee_d,
-            i_pk_chip,
+            i_pk_eval,
             tj_diode_current,
             inputs["algo_type"],
             inputs["i_nom_ref"],
@@ -717,19 +811,26 @@ def simulate_system(inputs: dict, tables: dict):
             p_sw_diode_chip = inputs["fsw"] * (erec_adj / 1000.0)
         else:
             i_corr = math.pow(
-                max(inputs["iout_rms"], 1e-12) / max((i_pk_chip * inputs["n_sim"]) / math.sqrt(2.0), 1e-12),
+                max(inputs["iout_rms"], 1e-12) / max(i_pk_eval / math.sqrt(2.0), 1e-12),
                 inputs["ki_frd"],
             ) if inputs["ki_frd"] > 0 else 1.0
             p_sw_main_chip = (inputs["fsw"] / math.pi) * ((eon_adj + eoff_adj) / 1000.0)
             p_sw_diode_chip = (inputs["fsw"] / math.pi) * (erec_adj / 1000.0) * i_corr
 
-        p_main_chip = cond_result["p_cond_main"] + p_sw_main_chip
-        p_diode_chip = cond_result["p_cond_diode"] + p_sw_diode_chip
-        p_total_arm = (p_main_chip + p_diode_chip) * inputs["n_sim"]
+        if use_half_bridge_cond or use_half_bridge_sw:
+            p_main_arm = cond_result["p_cond_main"] + p_sw_main_chip
+            p_diode_arm = cond_result["p_cond_diode"] + p_sw_diode_chip
+            p_main_chip = p_main_arm / bridge_chip_count
+            p_diode_chip = p_diode_arm / bridge_chip_count
+        else:
+            p_main_chip = cond_result["p_cond_main"] + p_sw_main_chip
+            p_diode_chip = cond_result["p_cond_diode"] + p_sw_diode_chip
+            p_main_arm = p_main_chip * bridge_chip_count
+            p_diode_arm = p_diode_chip * bridge_chip_count
+        p_total_arm = p_main_arm + p_diode_arm
 
         if "闭环" in inputs["sim_mode"]:
-            tj_main_new = inputs["t_case_main"] + p_main_chip * inputs["rth_jc_main"]
-            tj_diode_new = inputs["t_case_diode"] + p_diode_chip * inputs["rth_jc_diode"]
+            tj_main_new, tj_diode_new, thermal_meta = calc_coupled_junction_temperatures(inputs, p_main_chip, p_diode_chip)
         else:
             tj_main_new = inputs["fixed_tj"]
             tj_diode_new = inputs["fixed_tj"]
@@ -741,8 +842,13 @@ def simulate_system(inputs: dict, tables: dict):
                 "Tj_diode_used (℃)": round(tj_diode_current, 6),
                 "P_main_chip (W)": round(p_main_chip, 6),
                 "P_diode_chip (W)": round(p_diode_chip, 6),
+                "P_main_arm (W)": round(p_main_arm, 6),
+                "P_diode_arm (W)": round(p_diode_arm, 6),
                 "Tj_main_new (℃)": round(tj_main_new, 6),
                 "Tj_diode_new (℃)": round(tj_diode_new, 6),
+                "Main_rise (K)": round(float(thermal_meta["main_rise"]), 6) if np.isfinite(thermal_meta["main_rise"]) else np.nan,
+                "Diode_coupled_rise (K)": round(float(thermal_meta["diode_coupled_rise"]), 6) if np.isfinite(thermal_meta["diode_coupled_rise"]) else np.nan,
+                "Diode_self_rise (K)": round(float(thermal_meta["diode_self_rise"]), 6) if np.isfinite(thermal_meta["diode_self_rise"]) else np.nan,
             }
         )
 
@@ -758,13 +864,13 @@ def simulate_system(inputs: dict, tables: dict):
 
     dominant_tj = max(tj_main_current, tj_diode_current)
     p_total_system = p_total_arm * inputs["n_arm_system"]
-    p_main_total_system = p_main_chip * inputs["n_sim"] * inputs["n_arm_system"]
-    p_diode_total_system = p_diode_chip * inputs["n_sim"] * inputs["n_arm_system"]
-    p_main_switch_position = p_main_chip * inputs["n_sim"]
-    p_diode_switch_position = p_diode_chip * inputs["n_sim"]
+    p_main_total_system = p_main_arm * inputs["n_arm_system"]
+    p_diode_total_system = p_diode_arm * inputs["n_arm_system"]
+    p_main_switch_position = p_main_arm
+    p_diode_switch_position = p_diode_arm
 
-    star_ccm_df = build_star_ccm_total_heat_table(inputs["n_sim"], p_main_chip, p_diode_chip)
-    icepak_df = build_icepak_heat_table(inputs["n_sim"], p_main_chip, p_diode_chip)
+    star_ccm_df = build_star_ccm_total_heat_table(bridge_chip_count, p_main_chip, p_diode_chip)
+    icepak_df = build_icepak_heat_table(bridge_chip_count, p_main_chip, p_diode_chip)
     matrix_health_df = build_matrix_health_df(inputs, tables)
 
     extrapolation_df = pd.DataFrame(
@@ -828,6 +934,8 @@ def simulate_system(inputs: dict, tables: dict):
         ]
     )
 
+    diode_temp_label = "体二极管结温" if "SiC" in inputs["device_type"] else "续流路径参考温度"
+
     summary_df = pd.DataFrame(
         [
             {"指标": "运行场景", "数值": inputs["op_mode"], "单位": ""},
@@ -836,9 +944,16 @@ def simulate_system(inputs: dict, tables: dict):
             {"指标": "目标并联芯片数 N_sim", "数值": inputs["n_sim"], "单位": ""},
             {"指标": "系统桥臂数 N_arm_sys", "数值": inputs["n_arm_system"], "单位": ""},
             {"指标": "单颗峰值电流 I_pk", "数值": i_pk_chip, "单位": "A"},
+            {"指标": "半桥臂评估电流 I_pk_arm", "数值": i_pk_eval, "单位": "A"},
             {"指标": "主芯片结温", "数值": tj_main_current, "单位": "℃"},
-            {"指标": "二极管结温", "数值": tj_diode_current, "单位": "℃"},
+            {"指标": diode_temp_label, "数值": tj_diode_current, "单位": "℃"},
             {"指标": "控制结温（取最大）", "数值": dominant_tj, "单位": "℃"},
+            {"指标": "热学映射口径", "数值": inputs["thermal_model"], "单位": ""},
+            {"指标": "半桥臂单颗总损耗", "数值": p_main_chip + p_diode_chip, "单位": "W"},
+            {"指标": "结温映射驱动损耗", "数值": thermal_meta.get("driving_power_w", np.nan), "单位": "W"},
+            {"指标": "主芯片温升", "数值": thermal_meta["main_rise"], "单位": "K"},
+            {"指标": "续流路径映射温升", "数值": thermal_meta["diode_coupled_rise"], "单位": "K"},
+            {"指标": "续流路径独立附加温升", "数值": thermal_meta["diode_self_rise"], "单位": "K"},
             {"指标": "主芯片单颗发热率", "数值": p_main_chip, "单位": "W"},
             {"指标": "二极管单颗发热率", "数值": p_diode_chip, "单位": "W"},
             {"指标": "主开关并联位总损耗", "数值": p_main_switch_position, "单位": "W"},
@@ -873,9 +988,11 @@ def simulate_system(inputs: dict, tables: dict):
             {"参数": "导通原测芯片数", "取值": cond_src_count, "单位": ""},
             {"参数": "开关数据来源", "取值": inputs["sw_data_type"], "单位": ""},
             {"参数": "开关原测芯片数", "取值": sw_src_count, "单位": ""},
+            {"参数": "后参计算路径", "取值": "半桥臂优先" if ("Module" in inputs["cond_data_type"] or "Module" in inputs["sw_data_type"]) else "单芯直算", "单位": ""},
             {"参数": "目标仿真芯片数", "取值": inputs["n_sim"], "单位": ""},
             {"参数": "系统桥臂数", "取值": inputs["n_arm_system"], "单位": ""},
             {"参数": "热学模式", "取值": inputs["sim_mode"], "单位": ""},
+            {"参数": "热学映射口径", "取值": inputs["thermal_model"], "单位": ""},
             {"参数": "主/二极管热参数分离", "取值": inputs["split_thermal_params"], "单位": ""},
             {"参数": "母线电压 V_dc", "取值": inputs["vdc_act"], "单位": "V"},
             {"参数": "输出电流 I_out", "取值": inputs["iout_rms"], "单位": "A"},
@@ -914,6 +1031,10 @@ def simulate_system(inputs: dict, tables: dict):
                         {"参数": "二极管 RthJC_diode", "取值": inputs["rth_jc_diode"], "单位": "K/W"},
                         {"参数": "主芯片 Tc_main", "取值": inputs["t_case_main"], "单位": "℃"},
                         {"参数": "二极管 Tc_diode", "取值": inputs["t_case_diode"], "单位": "℃"},
+                        {"参数": "半桥臂总损耗参与结温映射", "取值": "SiC" in inputs["device_type"] and inputs["thermal_model"] == "half_bridge_main_reference", "单位": ""},
+                        {"参数": "IGBT仅主开关损耗映射结温", "取值": "SiC" not in inputs["device_type"] and inputs["thermal_model"] == "half_bridge_main_reference", "单位": ""},
+                        {"参数": "二极管耦合系数", "取值": inputs["diode_coupling_factor"], "单位": ""},
+                        {"参数": "二极管自发热权重", "取值": inputs["diode_self_heating_factor"], "单位": ""},
                     ]
                 ),
             ],
@@ -974,7 +1095,9 @@ def simulate_system(inputs: dict, tables: dict):
         "p_diode_total_system": p_diode_total_system,
         "tj_main_current": tj_main_current,
         "tj_diode_current": tj_diode_current,
+        "diode_temp_label": diode_temp_label,
         "dominant_tj": dominant_tj,
+        "thermal_meta": thermal_meta,
         "summary_df": summary_df,
         "loss_breakdown_df": loss_breakdown_df,
         "star_ccm_df": star_ccm_df,
@@ -1040,7 +1163,7 @@ with st.sidebar:
     st.divider()
     st.header("🧮 原始数据规格 (必填)")
     st.warning("程序会根据这里的选择，自动把原始数据拉平成“单芯模型”。")
-    cond_data_type = st.radio("A. 导通 V-I 表格代表：", ["单芯片数据 (Bare Die)", "模块半桥数据 (Module)"])
+    cond_data_type = st.radio("A. 导通 V-I 表格代表：", ["模块半桥数据 (Module)", "单芯片数据 (Bare Die)"])
     n_src_cond = st.number_input("V-I 原测模块芯片数", value=6, min_value=1, disabled="单芯片数据" in cond_data_type)
 
     sw_data_type = st.radio("B. 开关 E-I 表格代表：", ["模块半桥数据 (Module)", "单芯片数据 (Bare Die)"])
@@ -1055,23 +1178,44 @@ with st.sidebar:
     st.header("🔄 热学计算工作流")
     sim_mode = st.radio("模式选择", ["A. 开环盲算 (已知结温)", "B. 闭环迭代 (已知热阻)"])
     if "闭环" in sim_mode:
-        split_thermal_params = st.checkbox("主芯片 / 二极管分开热参数", value=True)
-        rth_jc_main = st.number_input("主芯片热阻 RthJC_main (K/W)", value=0.065, min_value=0.0, format="%.4f")
-        t_case_main = st.number_input("主芯片参考壳温 Tc_main (℃)", value=65.0)
+        thermal_model_label = st.radio(
+            "热学映射口径",
+            ["半桥臂热阻主导（推荐）", "主芯片 / 二极管独立双热阻", "主芯片热阻主导 + 二极管耦合"],
+        )
+        split_thermal_params = thermal_model_label == "主芯片 / 二极管独立双热阻"
+        rth_label = "半桥臂参考热阻 Rth_hb (K/W)" if thermal_model_label == "半桥臂热阻主导（推荐）" else "主芯片热阻 RthJC_main (K/W)"
+        tc_label = "半桥臂参考壳温 Tc_hb (℃)" if thermal_model_label == "半桥臂热阻主导（推荐）" else "主芯片参考壳温 Tc_main (℃)"
+        rth_jc_main = st.number_input(rth_label, value=0.065, min_value=0.0, format="%.4f")
+        t_case_main = st.number_input(tc_label, value=65.0)
         if split_thermal_params:
             rth_jc_diode = st.number_input("二极管热阻 RthJC_diode (K/W)", value=0.085, min_value=0.0, format="%.4f")
             t_case_diode = st.number_input("二极管参考壳温 Tc_diode (℃)", value=65.0)
-        else:
-            rth_jc_diode = rth_jc_main
+            diode_coupling_factor = 0.0
+            diode_self_heating_factor = 1.0
+            thermal_model = "dual_rth_independent"
+        elif thermal_model_label == "半桥臂热阻主导（推荐）":
+            diode_coupling_factor = 0.0
+            diode_self_heating_factor = 0.0
+            rth_jc_diode = 0.0
             t_case_diode = t_case_main
+            thermal_model = "half_bridge_main_reference"
+        else:
+            diode_coupling_factor = st.number_input("二极管耦合系数", value=0.85, min_value=0.0, max_value=1.5, format="%.2f")
+            diode_self_heating_factor = st.number_input("二极管自发热权重", value=0.25, min_value=0.0, max_value=1.5, format="%.2f")
+            rth_jc_diode = 0.0
+            t_case_diode = t_case_main
+            thermal_model = "main_rth_coupled"
         fixed_tj = None
     else:
         fixed_tj = st.number_input("设定全局目标结温 Tj (℃)", value=150.0)
+        thermal_model = "open_loop_fixed_tj"
         split_thermal_params = False
         rth_jc_main = None
         rth_jc_diode = None
         t_case_main = None
         t_case_diode = None
+        diode_coupling_factor = None
+        diode_self_heating_factor = None
 
     st.divider()
     engineer_memo = st.text_area(
@@ -1082,7 +1226,7 @@ with st.sidebar:
 
 st.divider()
 st.header("📊 第一步：特性数据录入 (归一化中心)")
-st.info("无论原始数据来自单芯还是模块，后台都会先做单芯归一化，再进行工况积分、热迭代和系统级还原。")
+st.info("默认按半桥臂后参优先处理：先计算半桥臂损耗，再折算单芯并做系统级扩容；只有 Bare Die 数据路径才直接按单芯坐标计算。")
 
 col_main, col_diode = st.columns(2)
 with col_main:
@@ -1163,11 +1307,14 @@ inputs = {
     "n_sim": int(n_sim),
     "n_arm_system": int(n_arm_system),
     "sim_mode": sim_mode,
+    "thermal_model": thermal_model,
     "split_thermal_params": bool(split_thermal_params),
     "rth_jc_main": 0.0 if rth_jc_main is None else float(rth_jc_main),
     "rth_jc_diode": 0.0 if rth_jc_diode is None else float(rth_jc_diode),
     "t_case_main": 0.0 if t_case_main is None else float(t_case_main),
     "t_case_diode": 0.0 if t_case_diode is None else float(t_case_diode),
+    "diode_coupling_factor": 0.0 if diode_coupling_factor is None else float(diode_coupling_factor),
+    "diode_self_heating_factor": 0.0 if diode_self_heating_factor is None else float(diode_self_heating_factor),
     "fixed_tj": 150.0 if fixed_tj is None else float(fixed_tj),
     "op_mode": op_mode,
     "vdc_act": float(vdc_act),
@@ -1260,13 +1407,18 @@ if result:
         st.warning(message)
     if "SiC" in result["device_type"]:
         st.info("SiC 架构锁已启用：主开关导通模型强制 `V0 = 0`，底层仅保留纯阻性发热项；二极管侧仍保留 `Vf0 + R`。")
+    if result["thermal_meta"]["thermal_model"] == "half_bridge_main_reference":
+        if "SiC" in result["device_type"]:
+            st.info("当前结温按主开关芯片与体二极管组合损耗映射到半桥臂参考热阻。")
+        else:
+            st.info("当前结温仅按 IGBT 主开关损耗映射到半桥臂参考热阻；FRD 对 IGBT 的热耦合默认视为已包含在该后参中。")
     if result["excel_warning"]:
         st.warning(result["excel_warning"])
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("控制结温 Tj,max", f"{result['dominant_tj']:.1f} ℃")
     m2.metric("主芯片结温", f"{result['tj_main_current']:.1f} ℃")
-    m3.metric("二极管结温", f"{result['tj_diode_current']:.1f} ℃")
+    m3.metric(result["diode_temp_label"], f"{result['tj_diode_current']:.1f} ℃")
     m4.metric("单臂总功耗", f"{result['p_total_arm']:.1f} W")
     m5.metric("系统级总功耗", f"{result['p_total_system']:.1f} W")
 
