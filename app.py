@@ -1005,6 +1005,30 @@ def simulate_system(inputs: dict, tables: dict):
             },
         ]
     )
+    characteristic_param_df = pd.DataFrame(
+        [
+            {
+                "对象": "主开关",
+                "输入方式": "手动 V0 + R" if inputs.get("cond_param_input_mode") == "manual_linearized" else "V-I 查表自动换算",
+                "当前输出电流 I_out,rms (A)": inputs["iout_rms"],
+                "计算电流 I_pk_cond (A)": i_pk_cond_domain,
+                "结温 Tj (℃)": tj_main_current,
+                "Vce / Vds (V)": main_model["v_pk"],
+                "Rce / Rds_dynamic (Ω)": main_model["r_eq"],
+                "V0 / Vce0 (V)": main_model["v0"],
+            },
+            {
+                "对象": "续流二极管",
+                "输入方式": "手动 V0 + R" if inputs.get("cond_param_input_mode") == "manual_linearized" else "V-I 查表自动换算",
+                "当前输出电流 I_out,rms (A)": inputs["iout_rms"],
+                "计算电流 I_pk_cond (A)": i_pk_cond_domain,
+                "结温 Tj (℃)": tj_diode_current,
+                "Vf / Vsd (V)": diode_model["v_pk"],
+                "Rf_dynamic (Ω)": diode_model["r_eq"],
+                "Vf0 / Vsd0 (V)": diode_model["v0"],
+            },
+        ]
+    )
 
     diode_temp_label = "体二极管结温" if "SiC" in inputs["device_type"] else "续流路径参考温度"
 
@@ -1187,6 +1211,7 @@ def simulate_system(inputs: dict, tables: dict):
         "star_ccm_df": star_ccm_df,
         "icepak_df": icepak_df,
         "linearized_df": linearized_df,
+        "characteristic_param_df": characteristic_param_df,
         "iteration_df": pd.DataFrame(iteration_rows),
         "matrix_health_df": matrix_health_df,
         "extrapolation_df": extrapolation_df,
@@ -1542,11 +1567,11 @@ if result:
     e4.metric("系统级总功耗", f"{result['p_total_system']:.1f} W")
 
     v1, v2, v3, v4 = st.columns(4)
-    v1.metric("主开关动态电阻", f"{result['main_model']['r_eq']:.6f} Ω")
-    v2.metric("主开关当前压降", f"{result['main_model']['v_pk']:.4f} V")
-    v3.metric("二极管动态电阻", f"{result['diode_model']['r_eq']:.6f} Ω")
-    v4.metric("二极管当前压降", f"{result['diode_model']['v_pk']:.4f} V")
-    st.caption("以上导通参数均对应当前计算工作点的导通域评估电流 `I_pk_cond`。")
+    v1.metric("主开关 Rce", f"{result['main_model']['r_eq']:.6f} Ω")
+    v2.metric("主开关 Vce", f"{result['main_model']['v_pk']:.4f} V")
+    v3.metric("二极管 Rf", f"{result['diode_model']['r_eq']:.6f} Ω")
+    v4.metric("二极管 Vf", f"{result['diode_model']['v_pk']:.4f} V")
+    st.caption("以上特性参数对应当前计算工作点；详细表见“结果总览 -> 特性参数结果（Vce / Rce）”。")
 
     st.info(
         f"开关能量温度策略：Eon = {result['eon_meta']['strategy_label']}；"
@@ -1574,6 +1599,8 @@ if result:
     tabs = st.tabs(["结果总览", "STAR-CCM+ 总热源", "Icepak 热源", "线性化模型", "热迭代历史", "归一化数据", "矩阵健康度", "外推监视", "公式审计"])
 
     with tabs[0]:
+        st.markdown("**特性参数结果（Vce / Rce）**")
+        st.dataframe(result["characteristic_param_df"], use_container_width=True)
         st.markdown("**损耗拆分总表**")
         st.dataframe(result["loss_breakdown_df"], use_container_width=True)
         st.markdown("**核心汇总指标**")
@@ -1593,7 +1620,7 @@ if result:
     with tabs[3]:
         st.markdown("**当前工作点线性化结果：V0 + R × I**")
         st.dataframe(result["linearized_df"], use_container_width=True)
-        st.caption("SiC 主开关在这里会明确显示 `Pure Resistive Lock = ON`。")
+        st.caption("SiC 主开关在这里会明确显示 `Pure Resistive Lock = ON`。如果你只关心 Vce / Rce，请直接看“结果总览”里的“特性参数结果”表。")
 
     with tabs[4]:
         st.markdown("**闭环热迭代记录**")
